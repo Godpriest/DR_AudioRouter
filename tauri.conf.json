@@ -1,0 +1,49 @@
+{
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "devPath": "./ui",
+    "distDir": "./ui",
+    "withGlobalTauri": true
+  },
+  "package": {
+    "productName": "DR_AudioRouter",
+    "version": "0.1.0"
+  },
+  "tauri": {
+    "allowlist": {
+      "all": true
+    },
+    "systemTray": {
+      "iconPath": "icons/icon.ico",
+      "iconAsTemplate": true
+    },
+    "bundle": {
+      "active": false,
+      "identifier": "com.dr.audiorouter",
+      "icon": [
+    "icons/32x32.png",
+    "icons/128x128.png",
+    "icons/128x128@2x.png",
+    "icons/icon.icns",
+    "icons/icon.ico"
+  ]
+    },
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "DR_AudioRouter",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 850,
+        "minHeight": 550,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true,
+        "transparent": false
+      }
+    ]
+  }
+}

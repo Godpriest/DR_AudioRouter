@@ -1,0 +1,641 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+}
+
+body {
+  background-color: #050713;
+  color: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  overflow: hidden;
+}
+
+/* 全域通用隱藏類別 (修復警告框無法隱藏的關鍵) */
+.hidden {
+  display: none !important;
+}
+
+.app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  padding: 24px 40px;
+  position: relative;
+}
+
+/* 標題風格 */
+.app-header {
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.logo-title {
+  font-size: 34px;
+  font-style: italic;
+  font-weight: 900;
+  letter-spacing: 2px;
+  color: #e2e8f0;
+}
+
+/* 工具列 */
+.toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 16px;
+  gap: 16px;
+}
+
+.search-wrapper {
+  flex: 1;
+  max-width: 420px;
+}
+
+#searchInput {
+  width: 100%;
+  height: 38px;
+  background-color: #121422;
+  border: 1px solid #1f2338;
+  border-radius: 8px;
+  padding: 0 14px;
+  color: #fff;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+#searchInput:focus {
+  border-color: #3b82f6;
+}
+
+.toolbar-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.obs-capsule {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background-color: #121422;
+  border: 1px solid #232742;
+  border-radius: 20px;
+  padding: 8px 16px;
+  color: #cbd5e1;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.obs-capsule:hover {
+  background-color: #1c2038;
+  border-color: #38bdf8;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #64748b;
+}
+
+.status-dot.green {
+  background-color: #22c55e;
+  box-shadow: 0 0 8px #22c55e;
+}
+
+.panic-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background-color: #450a0a;
+  border: 1px solid #7f1d1d;
+  color: #fca5a5;
+  border-radius: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.panic-btn:hover {
+  background-color: #7f1d1d;
+  color: #fff;
+}
+
+.panic-btn.active {
+  background-color: #dc2626;
+  color: #fff;
+  box-shadow: 0 0 12px #dc2626;
+}
+
+.icon {
+  width: 16px;
+  height: 16px;
+  fill: currentColor;
+}
+
+/* 混音器卡片捲動列表 */
+.mixer-list {
+  flex: 1;
+  overflow-y: auto;
+  padding-right: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.mixer-list::-webkit-scrollbar {
+  width: 6px;
+}
+
+.mixer-list::-webkit-scrollbar-thumb {
+  background: #1e2238;
+  border-radius: 3px;
+}
+
+/* 混音單元卡片 (預設暗色邊框) */
+.card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background-color: #11131f;
+  border: 1px solid #1c2035;
+  border-radius: 12px;
+  padding: 12px 20px;
+  transition: border-color 0.25s, box-shadow 0.25s, opacity 0.2s;
+  position: relative;
+}
+
+.card:hover {
+  border-color: #2b3152;
+}
+
+/* 【全新】個別特化狀態：高亮白色外框 + 微發光 */
+.card.customized {
+  border-color: #ffffff !important;
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.2) !important;
+}
+
+.card.offline {
+  opacity: 0.55;
+  border-style: dashed;
+}
+
+.card-left {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 250px;
+}
+
+.status-indicator {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background-color: #334155;
+}
+
+.status-indicator.active {
+  background-color: #22c55e;
+  box-shadow: 0 0 10px #22c55e;
+}
+
+.app-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 8px;
+  object-fit: contain;
+}
+
+.app-info {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.app-name {
+  font-size: 15px;
+  font-weight: 700;
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: #f8fafc;
+}
+
+.app-sub {
+  font-size: 12px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+/* 雙軌推桿區 */
+.card-faders {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 620px;
+}
+
+.fader-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.fader-btn {
+  background: none;
+  border: 1px solid transparent;
+  color: #94a3b8;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  transition: all 0.2s;
+}
+
+.fader-btn:hover {
+  color: #fff;
+}
+
+/* 靜音按鈕的紅色警示發光渲染 */
+.fader-btn.muted {
+  color: #ef4444 !important;
+  background-color: rgba(239, 68, 68, 0.2) !important;
+  border: 1px solid rgba(239, 68, 68, 0.5) !important;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
+}
+
+.btn-icon {
+  font-size: 14px;
+}
+
+.eq-icon {
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+}
+
+/* 細長推桿滑桿 */
+.fader-slider {
+  flex: 1;
+  appearance: none;
+  -webkit-appearance: none;
+  height: 4px;
+  background: #23273e;
+  border-radius: 2px;
+  outline: none;
+}
+
+.fader-slider::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 6px;
+  height: 20px;
+  background: #ffffff;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.fader-slider::-webkit-slider-thumb:hover {
+  background: #38bdf8;
+}
+
+.fader-val {
+  width: 48px;
+  text-align: right;
+  font-size: 13px;
+  color: #cbd5e1;
+  font-family: monospace;
+}
+
+/* 【全新】卡片最右側的「單顆重置按鈕」 */
+.card-right-action {
+  width: 44px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.card-reset-btn {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background-color: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.card-reset-btn:hover {
+  background-color: rgba(255, 255, 255, 0.2);
+  border-color: #ffffff;
+  box-shadow: 0 0 10px rgba(255, 255, 255, 0.35);
+  transform: rotate(-45deg);
+}
+
+/* 只要卡片「未特化（沒有 .customized）」就直接隱藏重置按鈕 */
+.card:not(.customized) .card-reset-btn {
+  display: none;
+}
+
+/* 左下角懸浮齒輪 */
+.settings-floating-btn {
+  position: absolute;
+  bottom: 24px;
+  left: 24px;
+  width: 42px;
+  height: 42px;
+  border-radius: 50%;
+  background-color: #121422;
+  border: 1px solid #232742;
+  font-size: 18px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+
+.settings-floating-btn:hover {
+  background-color: #1e2238;
+  transform: rotate(45deg);
+}
+
+/* 懸浮毛玻璃彈窗 */
+.modal-overlay {
+  position: absolute;
+  inset: 0;
+  background-color: rgba(5, 7, 19, 0.75);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  opacity: 1;
+  transition: opacity 0.2s;
+}
+
+.modal-content {
+  width: 480px;
+  background-color: #111322;
+  border: 1px solid #282d4a;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.8);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.modal-header h2 {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  color: #64748b;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.close-btn:hover {
+  color: #fff;
+}
+
+.setting-item {
+  margin-bottom: 16px;
+}
+
+.setting-item label {
+  display: block;
+  font-size: 13px;
+  color: #94a3b8;
+  margin-bottom: 6px;
+}
+
+.custom-select, .custom-input {
+  width: 100%;
+  height: 38px;
+  background-color: #181b2e;
+  border: 1px solid #2b3152;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+}
+
+.hz-tag {
+  font-size: 11px;
+  color: #38bdf8;
+  margin-top: 4px;
+  font-family: monospace;
+}
+
+.hz-warning-box {
+  background-color: #451a03;
+  border: 1px solid #b45309;
+  color: #fde68a;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 12px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.btn-primary {
+  width: 100%;
+  height: 38px;
+  background-color: #2563eb;
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  font-weight: 600;
+  font-size: 14px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.btn-primary:hover {
+  background-color: #1d4ed8;
+}
+
+/* 折疊箭頭按鈕 */
+.fold-btn {
+  background: none;
+  border: none;
+  color: #94a3b8;
+  font-size: 14px;
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.2s ease, color 0.2s;
+  border-radius: 4px;
+}
+
+.fold-btn:hover {
+  color: #38bdf8;
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* 展開/收合時的旋轉 */
+.fold-btn.collapsed {
+  transform: rotate(-90deg);
+}
+
+/* 預設群組與緊貼列表 */
+.group-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sub-followers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-left: 12px; /* 稍微縮排，形成樹狀階層感 */
+  border-left: 2px solid #1c2035;
+  margin-left: 10px;
+  margin-top: 2px;
+  transition: all 0.25s ease;
+}
+
+.sub-followers-list.collapsed {
+  display: none !important;
+}
+
+/* 分隔間隔線 */
+.section-divider {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 18px 0 10px 0;
+  opacity: 0.6;
+}
+
+.section-divider.hidden {
+  display: none !important;
+}
+
+.divider-line {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, #282d4a, transparent);
+}
+
+.divider-text {
+  font-size: 12px;
+  color: #64748b;
+  letter-spacing: 1px;
+  white-space: nowrap;
+}
+
+/* 離線卡片質感加強 */
+.card.offline {
+  opacity: 0.45;
+  border-style: dashed !important;
+  background-color: #0c0e18;
+}
+
+.card.offline .status-indicator {
+  background-color: #475569 !important;
+  box-shadow: none !important;
+}
+
+.card.offline:hover {
+  opacity: 0.75;
+}
+
+/* 齒輪彈窗右上角淺黃色問號說明按鈕 */
+    .help-icon-btn {
+      background: rgba(251, 191, 36, 0.12);
+      border: 1px solid rgba(251, 191, 36, 0.35);
+      color: #fbbf24;
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 800;
+      transition: all 0.2s ease;
+      outline: none;
+    }
+    .help-icon-btn:hover {
+      background: rgba(251, 191, 36, 0.25);
+      border-color: #fbbf24;
+      box-shadow: 0 0 10px rgba(251, 191, 36, 0.5);
+      color: #ffffff;
+      transform: scale(1.05);
+    }
+    .guide-card {
+      background: rgba(15, 23, 42, 0.55);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .guide-title {
+      font-size: 13px;
+      font-weight: bold;
+      color: #38bdf8;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .guide-text {
+      font-size: 12px;
+      color: #cbd5e1;
+      line-height: 1.6;
+      margin: 0;
+    }
+    .guide-step-box {
+      background: rgba(0, 0, 0, 0.35);
+      border-left: 3px solid #fbbf24;
+      padding: 8px 12px;
+      margin-top: 8px;
+      border-radius: 0 6px 6px 0;
+      font-size: 11.5px;
+      color: #e2e8f0;
+      line-height: 1.65;
+    }
+    .kbd-tag {
+      background: #334155;
+      color: #f8fafc;
+      padding: 1px 5px;
+      border-radius: 4px;
+      border: 1px solid #475569;
+      font-family: monospace;
+      font-size: 11px;
+    }
