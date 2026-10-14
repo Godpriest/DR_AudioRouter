@@ -151,8 +151,8 @@ npx @tauri-apps/cli@1 build
 
 ---
 
-## 📄 授權與聲明 (License & Credits)
+## 授權與版權
+- Copyright © Demon Realm / Godpriest
 
-* **作者與版權**：Copyright © Demon Realm / Godpriest
-* **授權方式**：本專案採用 [MIT License](LICENSE) 條款開放。
-* **AI 協助聲明**：本軟體的部分架構、演算法推導與文件經由 AI 輔助產生與修訂，最終代碼均由作者親自審閱、整合測試與實機驗證。
+## AI 協助
+本插件的部分程式碼與文件經由 AI 輔助產生與修訂，最終內容均由作者審閱並整合。
