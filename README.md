@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Language-Rust-DEA584?logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/Framework-Tauri%20v1-24C8DB?logo=tauri" alt="Tauri">
   <img src="https://img.shields.io/badge/Latency-%3C%2030ms-brightgreen" alt="Latency">
-  <img src="https://img.shields.io/badge/License-MIT-blue" alt="License">
 </p>
 
 ---
