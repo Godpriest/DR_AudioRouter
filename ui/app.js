@@ -593,7 +593,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   initGlobalControlsUI();
   initUIEventListeners();
   initFirstLoad();
-  setInterval(syncRunningStatusAndAppendNew, 2500);
+  setInterval(syncRunningStatusAndAppendNew, 500);
   setInterval(pollActiveTabLevels, 100);
   setInterval(cleanupTransientOfflineCards, 60000);
 });

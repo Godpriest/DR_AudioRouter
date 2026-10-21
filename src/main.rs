@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use nnnoiseless::DenoiseState;
@@ -1100,7 +1100,10 @@ fn get_process_path_by_pid(pid: u32) -> Option<String> {
     }
 }
 
-fn build_process_maps() -> (HashMap<u32, String>, HashMap<u32, u32>) {
+// 具備 3 秒智慧快取的系統進程表：避免 0.5 秒高頻掃描時重複觸發昂貴的系統快照 API
+static PROCESS_MAP_CACHE: Mutex<Option<(Instant, HashMap<u32, String>, HashMap<u32, u32>)>> = Mutex::new(None);
+
+fn take_process_snapshot() -> (HashMap<u32, String>, HashMap<u32, u32>) {
     let mut name_map = HashMap::new();
     let mut parent_map = HashMap::new();
     unsafe {
@@ -1124,6 +1127,20 @@ fn build_process_maps() -> (HashMap<u32, String>, HashMap<u32, u32>) {
         }
     }
     (name_map, parent_map)
+}
+
+fn build_process_maps() -> (HashMap<u32, String>, HashMap<u32, u32>) {
+    if let Ok(mut guard) = PROCESS_MAP_CACHE.lock() {
+        if let Some((last_time, ref n_map, ref p_map)) = *guard {
+            if last_time.elapsed() < Duration::from_secs(3) {
+                return (n_map.clone(), p_map.clone());
+            }
+        }
+        let (n_map, p_map) = take_process_snapshot();
+        *guard = Some((Instant::now(), n_map.clone(), p_map.clone()));
+        return (n_map, p_map);
+    }
+    take_process_snapshot()
 }
 
 fn find_same_exe_root_pid(
@@ -1157,7 +1174,8 @@ fn find_same_exe_root_pid(
 fn enumerate_active_audio_pids() -> Vec<u32> {
     let mut pids = HashSet::new();
     let my_pid = std::process::id();
-    let (name_map, parent_map) = build_process_maps();
+    let (mut name_map, mut parent_map) = build_process_maps();
+    let mut snapshot_refreshed = false;
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1177,6 +1195,16 @@ fn enumerate_active_audio_pids() -> Vec<u32> {
                                                 if pid > 0 && pid != my_pid {
                                                     if let Ok(state) = control2.GetState() {
                                                         if state != AudioSessionStateExpired {
+                                                            // 若遇到剛開啟、還不在 3 秒快取內的新進程，立即刷新一次快照以實現零延遲識別
+                                                            if !snapshot_refreshed && !name_map.contains_key(&pid) {
+                                                                let (n, p) = take_process_snapshot();
+                                                                if let Ok(mut guard) = PROCESS_MAP_CACHE.lock() {
+                                                                    *guard = Some((Instant::now(), n.clone(), p.clone()));
+                                                                }
+                                                                name_map = n;
+                                                                parent_map = p;
+                                                                snapshot_refreshed = true;
+                                                            }
                                                             let root_pid = find_same_exe_root_pid(pid, &name_map, &parent_map);
                                                             pids.insert(root_pid);
                                                         }
@@ -2144,7 +2172,7 @@ fn main() {
                 while !*d && is_running_cap.load(Ordering::Relaxed) {
                     let (new_d, timeout) = notifier_sched
                         .cvar
-                        .wait_timeout(d, Duration::from_secs(2))
+                        .wait_timeout(d, Duration::from_millis(500))
                         .unwrap();
                     d = new_d;
                     if timeout.timed_out() {
@@ -2259,7 +2287,7 @@ fn main() {
 
                 drop(workers_map);
 
-                thread::sleep(Duration::from_millis(1000));
+                thread::sleep(Duration::from_millis(400));
 
                 if !is_running_cap.load(Ordering::Relaxed) {
                     break 'throttle_loop;
