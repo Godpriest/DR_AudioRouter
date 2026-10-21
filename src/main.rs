@@ -14,6 +14,7 @@ use std::thread;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use nnnoiseless::DenoiseState;
 use rtrb::{Consumer, Producer, RingBuffer};
 use serde::{Deserialize, Serialize};
 use tauri::{
@@ -124,13 +125,14 @@ struct SessionNotificationHandler {
 }
 
 impl IAudioSessionNotification_Impl for SessionNotificationHandler {
+    #[allow(non_snake_case)]
     fn OnSessionCreated(&self, _newsession: Option<&IAudioSessionControl>) -> Result<()> {
         self.notifier.trigger();
         Ok(())
     }
 }
 
-// --- DSP 等化器與小聲音增益資料結構 ---
+// --- DSP 等化器與動態音量平衡資料結構 ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EqBandDto {
@@ -168,29 +170,42 @@ impl Default for EqConfigDto {
     }
 }
 
+// 系統混音 (喇叭 / OBS) 動態音量平衡預設值: -80 / 30 / -10 / 0 / -20 / 40
+fn def_spk_noise_floor() -> f32 { -80.0 }
+fn def_spk_boost() -> f32 { 30.0 }
+fn def_spk_safe_min() -> f32 { -10.0 }
+fn def_spk_safe_max() -> f32 { 0.0 }
+fn def_spk_down_cut() -> f32 { -20.0 }
+fn def_spk_loud_max() -> f32 { 40.0 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoostConfigDto {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_noise_floor")]
+    #[serde(default = "def_spk_noise_floor")]
     pub noise_floor_db: f32,
-    #[serde(default = "default_ceiling")]
-    pub ceiling_db: f32,
-    #[serde(default = "default_boost")]
+    #[serde(default = "def_spk_boost")]
     pub boost_db: f32,
+    #[serde(default = "def_spk_safe_min")]
+    pub safe_min_db: f32,
+    #[serde(default = "def_spk_safe_max")]
+    pub safe_max_db: f32,
+    #[serde(default = "def_spk_down_cut")]
+    pub downward_cut_db: f32,
+    #[serde(default = "def_spk_loud_max")]
+    pub loud_max_db: f32,
 }
-
-fn default_noise_floor() -> f32 { -55.0 }
-fn default_ceiling() -> f32 { -20.0 }
-fn default_boost() -> f32 { 8.0 }
 
 impl Default for BoostConfigDto {
     fn default() -> Self {
         Self {
             enabled: false,
-            noise_floor_db: default_noise_floor(),
-            ceiling_db: default_ceiling(),
-            boost_db: default_boost(),
+            noise_floor_db: def_spk_noise_floor(),
+            boost_db: def_spk_boost(),
+            safe_min_db: def_spk_safe_min(),
+            safe_max_db: def_spk_safe_max(),
+            downward_cut_db: def_spk_down_cut(),
+            loud_max_db: def_spk_loud_max(),
         }
     }
 }
@@ -201,6 +216,107 @@ pub struct ChannelDspDto {
     pub eq: EqConfigDto,
     #[serde(default)]
     pub boost: BoostConfigDto,
+}
+
+// --- 麥克風擴充模組設定結構 (預設值: -55 / 10 / -35 / 0 / -20 / 40) ---
+
+fn default_mic_input() -> String { "__DEFAULT__".to_string() }
+fn default_mic_output() -> String { "__NONE__".to_string() }
+fn default_mic_vol() -> f32 { 1.0 }
+fn default_hpf_hz() -> f32 { 80.0 }
+fn default_nr_pre_gain() -> f32 { 1.0 }
+fn default_nr_vad() -> f32 { 0.45 }
+fn default_nr_wet() -> f32 { 0.95 }
+
+fn def_mic_noise_floor() -> f32 { -55.0 }
+fn def_mic_boost() -> f32 { 10.0 }
+fn def_mic_safe_min() -> f32 { -35.0 }
+fn def_mic_safe_max() -> f32 { 0.0 }
+fn def_mic_down_cut() -> f32 { -20.0 }
+fn def_mic_loud_max() -> f32 { 40.0 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MicConfigDto {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub self_monitor: bool,
+    #[serde(default = "default_mic_input")]
+    pub input_device: String,
+    #[serde(default = "default_mic_output")]
+    pub output_device: String,
+    #[serde(default = "default_mic_vol")]
+    pub output_volume: f32,
+
+    // 第 1 關：前置高通濾波器 (HPF 低切)
+    #[serde(default)]
+    pub hpf_enabled: bool,
+    #[serde(default = "default_hpf_hz")]
+    pub hpf_cutoff_hz: f32,
+
+    // 第 2 關：AI 智慧雜訊抑制 (輸入前增益 + VAD 人聲權重門檻 + 降噪深度)
+    #[serde(default)]
+    pub nr_enabled: bool,
+    #[serde(default = "default_nr_pre_gain")]
+    pub nr_pre_gain: f32,
+    #[serde(default = "default_nr_vad")]
+    pub nr_vad_thresh: f32,
+    #[serde(default = "default_nr_wet")]
+    pub nr_wet_mix: f32,
+
+    // 第 3 關：7 段人聲等化器 (7-Band EQ)
+    #[serde(default)]
+    pub eq: EqConfigDto,
+
+    // 第 4 關：動態音量平衡 (6 參數統一規格)
+    #[serde(default)]
+    pub dyn_enabled: bool,
+    #[serde(default = "def_mic_noise_floor")]
+    pub noise_floor_db: f32,
+    #[serde(default = "def_mic_boost")]
+    pub upward_boost_db: f32,
+    #[serde(default = "def_mic_safe_min")]
+    pub safe_min_db: f32,
+    #[serde(default = "def_mic_safe_max")]
+    pub safe_max_db: f32,
+    #[serde(default = "def_mic_down_cut")]
+    pub downward_cut_db: f32,
+    #[serde(default = "def_mic_loud_max")]
+    pub loud_max_db: f32,
+}
+
+impl Default for MicConfigDto {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            self_monitor: false,
+            input_device: default_mic_input(),
+            output_device: default_mic_output(),
+            output_volume: default_mic_vol(),
+            hpf_enabled: false,
+            hpf_cutoff_hz: default_hpf_hz(),
+            nr_enabled: false,
+            nr_pre_gain: default_nr_pre_gain(),
+            nr_vad_thresh: default_nr_vad(),
+            nr_wet_mix: default_nr_wet(),
+            eq: EqConfigDto::default(),
+            dyn_enabled: false,
+            noise_floor_db: def_mic_noise_floor(),
+            upward_boost_db: def_mic_boost(),
+            safe_min_db: def_mic_safe_min(),
+            safe_max_db: def_mic_safe_max(),
+            downward_cut_db: def_mic_down_cut(),
+            loud_max_db: def_mic_loud_max(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MicLevelsDto {
+    pub input_db: f32,
+    pub output_db: f32,
+    pub is_running: bool,
+    pub conflict_warning: Option<String>,
 }
 
 // --- 單一 config.json 資料結構 ---
@@ -236,6 +352,8 @@ pub struct ProfileDto {
     pub global: GlobalVolumeStateDto,
     #[serde(default)]
     pub customized_apps: HashMap<String, AppChannelVolumeDto>,
+    #[serde(default)]
+    pub mic: MicConfigDto,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +395,7 @@ fn default_profiles() -> HashMap<String, ProfileDto> {
                 str_dsp: None,
             },
             customized_apps: HashMap::new(),
+            mic: MicConfigDto::default(),
         },
     );
     map
@@ -292,6 +411,54 @@ impl Default for FullConfigDto {
             active_profile_id: default_active_profile_id(),
             profiles: default_profiles(),
         }
+    }
+}
+
+// --- 統一 6 參數「動態音量平衡」核心數學運算函式 ---
+#[inline(always)]
+fn compute_dynamic_gain_db(
+    db: f32,
+    noise_floor_db: f32,
+    boost_db: f32,
+    safe_min_db: f32,
+    safe_max_db: f32,
+    down_cut_db: f32,
+    loud_max_db: f32,
+    voice_weight: f32,
+) -> f32 {
+    let s_min = safe_min_db.max(noise_floor_db + 0.5);
+    let s_max = safe_max_db.max(s_min + 0.5);
+    let l_max = loud_max_db.max(s_max + 0.5);
+
+    let max_boost = boost_db.abs();
+    let max_cut = down_cut_db.abs();
+
+    if db <= noise_floor_db - 6.0 {
+        // 低於過小聲遮蔽門檻：捨棄補償 (0 dB 原音直通)
+        0.0
+    } else if db < s_min {
+        // 過小聲區間 (過小聲遮蔽門檻 ~ 安全區下限)：靠近門檻補滿額，越接近安全區下限越趨近 0
+        let range = (s_min - noise_floor_db).max(1.0);
+        let progress = ((s_min - db) / range).clamp(0.0, 1.0);
+        let gate_fade = if db < noise_floor_db {
+            ((db - (noise_floor_db - 6.0)) / 6.0).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let raw_boost = max_boost * progress * gate_fade * voice_weight;
+        raw_boost.min(s_min - db)
+    } else if db <= s_max {
+        // 安全區 (安全區下限 ~ 安全區上限)：0 dB 原音穩定直通
+        0.0
+    } else if db < l_max {
+        // 過大聲漸進區間 (安全區上限 ~ 過大聲音量上限)：越接近上限減少越多，到達上限時減少滿額
+        let over_range = (l_max - s_max).max(1.0);
+        let progress = ((db - s_max) / over_range).clamp(0.0, 1.0);
+        let raw_cut = max_cut * progress;
+        -(raw_cut.min(db - s_max))
+    } else {
+        // 超過過大聲音量上限：不捨棄聲音，固定套用滿額的「過大聲音量減少」量
+        -(max_cut.min(db - s_max))
     }
 }
 
@@ -313,6 +480,29 @@ impl Default for BiquadCoeffs {
 }
 
 impl BiquadCoeffs {
+    fn calculate_hpf(cutoff_hz: f32, sample_rate: f32) -> Self {
+        let f0 = cutoff_hz.clamp(20.0, 400.0);
+        let w0 = 2.0 * std::f32::consts::PI * f0 / sample_rate;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * 0.70710678);
+
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+        let b0 = (1.0 + cos_w0) * 0.5;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) * 0.5;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+        }
+    }
+
     fn calculate(band_idx: usize, freq: f32, gain_db: f32, q: f32, sample_rate: f32) -> Self {
         if gain_db.abs() < 0.05 {
             return Self::default();
@@ -380,8 +570,11 @@ struct ChannelDspRuntime {
 
     boost_enabled: bool,
     noise_floor_db: f32,
-    ceiling_db: f32,
-    boost_multiplier: f32,
+    boost_db: f32,
+    safe_min_db: f32,
+    safe_max_db: f32,
+    downward_cut_db: f32,
+    loud_max_db: f32,
     current_boost_gain: f32,
 }
 
@@ -393,16 +586,18 @@ impl Default for ChannelDspRuntime {
             eq_state_l: [BiquadState::default(); 7],
             eq_state_r: [BiquadState::default(); 7],
             boost_enabled: false,
-            noise_floor_db: -55.0,
-            ceiling_db: -20.0,
-            boost_multiplier: 1.0,
+            noise_floor_db: def_spk_noise_floor(),
+            boost_db: def_spk_boost(),
+            safe_min_db: def_spk_safe_min(),
+            safe_max_db: def_spk_safe_max(),
+            downward_cut_db: def_spk_down_cut(),
+            loud_max_db: def_spk_loud_max(),
             current_boost_gain: 1.0,
         }
     }
 }
 
 impl ChannelDspRuntime {
-    // 【替換後的斜率收窄版】
     #[inline(always)]
     fn process_stereo(&mut self, mut l: f32, mut r: f32) -> (f32, f32) {
         if self.eq_enabled {
@@ -416,20 +611,18 @@ impl ChannelDspRuntime {
             let peak = l.abs().max(r.abs());
             let db = if peak > 1e-6 { 20.0 * peak.log10() } else { -120.0 };
 
-            let target_gain = if db >= self.ceiling_db || db <= self.noise_floor_db - 6.0 {
-                1.0
-            } else {
-                // 斜率收窄：越小聲補償越滿，越大聲補償越少，至天花板平滑歸零
-                let range = (self.ceiling_db - self.noise_floor_db).max(6.0);
-                let progress = ((self.ceiling_db - db) / range).clamp(0.0, 1.0);
-                let gate_fade = ((db - (self.noise_floor_db - 6.0)) / 6.0).clamp(0.0, 1.0);
+            let target_gain_db = compute_dynamic_gain_db(
+                db,
+                self.noise_floor_db,
+                self.boost_db,
+                self.safe_min_db,
+                self.safe_max_db,
+                self.downward_cut_db,
+                self.loud_max_db,
+                1.0,
+            );
 
-                let max_boost_db = 20.0 * self.boost_multiplier.log10();
-                let applied_boost_db = max_boost_db * progress * gate_fade;
-                10.0f32.powf(applied_boost_db / 20.0)
-            };
-
-            // 大聲來時迅速回退 (0.01) 保護耳朵，小聲時平緩回托 (0.0005) 避免喘氣感
+            let target_gain = 10.0f32.powf(target_gain_db / 20.0);
             let rate = if target_gain < self.current_boost_gain { 0.01 } else { 0.0005 };
             self.current_boost_gain += (target_gain - self.current_boost_gain) * rate;
 
@@ -447,10 +640,205 @@ impl ChannelDspRuntime {
         }
         self.boost_enabled = dsp.boost.enabled;
         self.noise_floor_db = dsp.boost.noise_floor_db;
-        self.ceiling_db = dsp.boost.ceiling_db;
-        self.boost_multiplier = 10.0f32.powf(dsp.boost.boost_db / 20.0);
+        self.boost_db = dsp.boost.boost_db;
+        self.safe_min_db = dsp.boost.safe_min_db;
+        self.safe_max_db = dsp.boost.safe_max_db;
+        self.downward_cut_db = dsp.boost.downward_cut_db;
+        self.loud_max_db = dsp.boost.loud_max_db;
         if self.current_boost_gain <= 0.0 {
             self.current_boost_gain = 1.0;
+        }
+    }
+}
+
+// --- 麥克風 4 級專業 DSP 執行引擎 ---
+
+struct MicDspRuntime {
+    sample_rate: f32,
+    output_volume: f32,
+
+    // Stage 1: HPF
+    hpf_enabled: bool,
+    hpf_coeffs: BiquadCoeffs,
+    hpf_state: BiquadState,
+
+    // Stage 2: RNNoise (nnnoiseless) + Pre-Gain + VAD Gate + Dry/Wet
+    nr_enabled: bool,
+    nr_pre_gain: f32,
+    nr_vad_thresh: f32,
+    nr_wet_mix: f32,
+    current_vad_prob: f32,
+    vad_env_gain: f32,
+    denoise: Box<DenoiseState<'static>>,
+    nr_in_accum: Vec<f32>,
+
+    // Stage 3: 7-Band EQ
+    eq_enabled: bool,
+    eq_coeffs: [BiquadCoeffs; 7],
+    eq_state: [BiquadState; 7],
+
+    // Stage 4: 動態音量平衡 (6 參數統一規格)
+    dyn_enabled: bool,
+    noise_floor_db: f32,
+    upward_boost_db: f32,
+    safe_min_db: f32,
+    safe_max_db: f32,
+    downward_cut_db: f32,
+    loud_max_db: f32,
+    current_dyn_gain: f32,
+}
+
+impl MicDspRuntime {
+    fn new(sample_rate: f32) -> Self {
+        Self {
+            sample_rate,
+            output_volume: 1.0,
+            hpf_enabled: false,
+            hpf_coeffs: BiquadCoeffs::calculate_hpf(80.0, sample_rate),
+            hpf_state: BiquadState::default(),
+            nr_enabled: false,
+            nr_pre_gain: 1.0,
+            nr_vad_thresh: 0.45,
+            nr_wet_mix: 0.95,
+            current_vad_prob: 1.0,
+            vad_env_gain: 1.0,
+            denoise: DenoiseState::new(),
+            nr_in_accum: Vec::with_capacity(DenoiseState::FRAME_SIZE),
+            eq_enabled: false,
+            eq_coeffs: [BiquadCoeffs::default(); 7],
+            eq_state: [BiquadState::default(); 7],
+            dyn_enabled: false,
+            noise_floor_db: def_mic_noise_floor(),
+            upward_boost_db: def_mic_boost(),
+            safe_min_db: def_mic_safe_min(),
+            safe_max_db: def_mic_safe_max(),
+            downward_cut_db: def_mic_down_cut(),
+            loud_max_db: def_mic_loud_max(),
+            current_dyn_gain: 1.0,
+        }
+    }
+
+    fn update_config(&mut self, cfg: &MicConfigDto) {
+        self.output_volume = cfg.output_volume;
+        self.hpf_enabled = cfg.hpf_enabled;
+        self.hpf_coeffs = BiquadCoeffs::calculate_hpf(cfg.hpf_cutoff_hz, self.sample_rate);
+
+        self.nr_enabled = cfg.nr_enabled;
+        self.nr_pre_gain = cfg.nr_pre_gain.clamp(0.0, 5.0);
+        self.nr_vad_thresh = cfg.nr_vad_thresh.clamp(0.0, 0.98);
+        self.nr_wet_mix = cfg.nr_wet_mix.clamp(0.0, 1.0);
+
+        self.eq_enabled = cfg.eq.enabled;
+        for (i, band) in cfg.eq.bands.iter().enumerate().take(7) {
+            self.eq_coeffs[i] = BiquadCoeffs::calculate(i, band.freq, band.gain_db, band.q, self.sample_rate);
+        }
+
+        self.dyn_enabled = cfg.dyn_enabled;
+        self.noise_floor_db = cfg.noise_floor_db;
+        self.upward_boost_db = cfg.upward_boost_db;
+        self.safe_min_db = cfg.safe_min_db;
+        self.safe_max_db = cfg.safe_max_db;
+        self.downward_cut_db = cfg.downward_cut_db;
+        self.loud_max_db = cfg.loud_max_db;
+        if self.current_dyn_gain <= 0.0 {
+            self.current_dyn_gain = 1.0;
+        }
+    }
+
+    #[inline(always)]
+    fn process_post_nr_sample(&mut self, mut x: f32) -> f32 {
+        // 第 3 關：7 段等化器
+        if self.eq_enabled {
+            for i in 0..7 {
+                x = self.eq_state[i].process(x, &self.eq_coeffs[i]);
+            }
+        }
+
+        // 第 4 關：動態音量平衡 (6 參數統一規格 + AI 人聲權重防底噪放大連動)
+        if self.dyn_enabled {
+            let peak = x.abs();
+            let db = if peak > 1e-6 { 20.0 * peak.log10() } else { -120.0 };
+
+            let voice_weight = if self.nr_enabled { self.vad_env_gain } else { 1.0 };
+
+            let target_gain_db = compute_dynamic_gain_db(
+                db,
+                self.noise_floor_db,
+                self.upward_boost_db,
+                self.safe_min_db,
+                self.safe_max_db,
+                self.downward_cut_db,
+                self.loud_max_db,
+                voice_weight,
+            );
+
+            let target_gain = 10.0f32.powf(target_gain_db / 20.0);
+            let rate = if target_gain < self.current_dyn_gain { 0.02 } else { 0.0006 };
+            self.current_dyn_gain += (target_gain - self.current_dyn_gain) * rate;
+
+            x *= self.current_dyn_gain;
+        }
+
+        (x * self.output_volume).clamp(-1.0, 1.0)
+    }
+
+    fn process_mono_chunk(&mut self, input: &[f32], out_vec: &mut Vec<f32>) {
+        out_vec.clear();
+        for &raw in input {
+            // 第 1 關：前置高通濾波器 (HPF)
+            let s1 = if self.hpf_enabled {
+                self.hpf_state.process(raw, &self.hpf_coeffs)
+            } else {
+                raw
+            };
+
+            // 第 2 關：nnnoiseless AI 降噪 (輸入前增益 -> AI 辨識與 VAD 門檻 -> 降噪深度混合)
+            if self.nr_enabled {
+                let pre = s1 * self.nr_pre_gain;
+                let boosted_s1 = if pre.abs() > 0.85 {
+                    pre.signum() * (0.85 + 0.15 * ((pre.abs() - 0.85) / 0.15).tanh())
+                } else {
+                    pre
+                };
+
+                self.nr_in_accum.push(boosted_s1);
+                if self.nr_in_accum.len() == DenoiseState::FRAME_SIZE {
+                    let mut scaled_in = [0.0f32; DenoiseState::FRAME_SIZE];
+                    let mut scaled_out = [0.0f32; DenoiseState::FRAME_SIZE];
+                    for i in 0..DenoiseState::FRAME_SIZE {
+                        scaled_in[i] = (self.nr_in_accum[i] * 32768.0).clamp(-32768.0, 32767.0);
+                    }
+                    let vad_prob = self.denoise.process_frame(&mut scaled_out[..], &scaled_in[..]);
+                    self.current_vad_prob = vad_prob;
+
+                    let target_vad_gain = if self.nr_vad_thresh <= 0.01 || vad_prob >= self.nr_vad_thresh {
+                        1.0
+                    } else {
+                        let ratio = (vad_prob / self.nr_vad_thresh.max(0.01)).clamp(0.0, 1.0);
+                        ratio * ratio
+                    };
+
+                    let wet_ratio = self.nr_wet_mix;
+                    let dry_ratio = 1.0 - wet_ratio;
+
+                    for i in 0..DenoiseState::FRAME_SIZE {
+                        let vad_rate = if target_vad_gain > self.vad_env_gain { 0.05 } else { 0.002 };
+                        self.vad_env_gain += (target_vad_gain - self.vad_env_gain) * vad_rate;
+
+                        let dry = self.nr_in_accum[i];
+                        let wet = scaled_out[i] / 32768.0;
+                        let mixed = (dry * dry_ratio + wet * wet_ratio) * self.vad_env_gain;
+                        let final_s = self.process_post_nr_sample(mixed);
+                        out_vec.push(final_s);
+                    }
+                    self.nr_in_accum.clear();
+                }
+            } else {
+                self.nr_in_accum.clear();
+                self.vad_env_gain = 1.0;
+                let final_s = self.process_post_nr_sample(s1);
+                out_vec.push(final_s);
+            }
         }
     }
 }
@@ -491,13 +879,13 @@ pub struct AudioSettingsDto {
     pub buffer_size: u32,
 }
 
-// 將 DSP 直接封裝於 WorkerHandle 內部，徹底消除借用衝突與多重查表延遲
 struct WorkerHandle {
     pid: u32,
     is_running: Arc<AtomicBool>,
     consumer: Consumer<f32>,
     mon_dsp: ChannelDspRuntime,
     str_dsp: ChannelDspRuntime,
+    peak_db_bits: Arc<AtomicU32>,
 }
 
 #[allow(dead_code)]
@@ -512,6 +900,11 @@ struct AppState {
     settings: Arc<Mutex<FullConfigDto>>,
     icon_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
     workers: Arc<Mutex<HashMap<String, WorkerHandle>>>,
+    mic_live_config: Arc<Mutex<MicConfigDto>>,
+    mic_config_dirty: Arc<AtomicBool>,
+    mic_in_db_bits: Arc<AtomicU32>,
+    mic_out_db_bits: Arc<AtomicU32>,
+    mic_is_active: Arc<AtomicBool>,
 }
 
 fn load_or_create_config() -> FullConfigDto {
@@ -530,8 +923,12 @@ fn load_or_create_config() -> FullConfigDto {
 fn is_system_internal(exe_lower: &str) -> bool {
     exe_lower.is_empty()
         || exe_lower.contains("dr_audiorouter")
-        || exe_lower == "audiodg.exe"
         || exe_lower.starts_with("audiodg")
+        || exe_lower == "svchost.exe"
+        || exe_lower == "system"
+        || exe_lower.contains("steinberg")
+        || exe_lower.contains("ysusb")
+        || exe_lower.contains("yamaha")
 }
 
 // 使用 Windows 原生 advapi32 直讀註冊表，徹底解決呼叫外部 reg.exe 造成的 2~3 秒凍結
@@ -703,8 +1100,9 @@ fn get_process_path_by_pid(pid: u32) -> Option<String> {
     }
 }
 
-fn build_process_name_map() -> HashMap<u32, String> {
-    let mut map = HashMap::new();
+fn build_process_maps() -> (HashMap<u32, String>, HashMap<u32, u32>) {
+    let mut name_map = HashMap::new();
+    let mut parent_map = HashMap::new();
     unsafe {
         if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
             let mut entry = PROCESSENTRY32W::default();
@@ -714,7 +1112,8 @@ fn build_process_name_map() -> HashMap<u32, String> {
                 loop {
                     let name = String::from_utf16_lossy(&entry.szExeFile);
                     let clean = name.trim_matches('\0').to_string();
-                    map.insert(entry.th32ProcessID, clean);
+                    name_map.insert(entry.th32ProcessID, clean);
+                    parent_map.insert(entry.th32ProcessID, entry.th32ParentProcessID);
 
                     if !Process32NextW(snapshot, &mut entry).as_bool() {
                         break;
@@ -724,12 +1123,41 @@ fn build_process_name_map() -> HashMap<u32, String> {
             let _ = CloseHandle(snapshot);
         }
     }
-    map
+    (name_map, parent_map)
+}
+
+fn find_same_exe_root_pid(
+    mut pid: u32,
+    name_map: &HashMap<u32, String>,
+    parent_map: &HashMap<u32, u32>,
+) -> u32 {
+    let my_exe = match name_map.get(&pid) {
+        Some(n) => n.to_ascii_lowercase(),
+        None => return pid,
+    };
+    let mut visited = HashSet::new();
+    visited.insert(pid);
+
+    while let Some(&parent_pid) = parent_map.get(&pid) {
+        if parent_pid == 0 || visited.contains(&parent_pid) {
+            break;
+        }
+        if let Some(parent_exe) = name_map.get(&parent_pid) {
+            if parent_exe.to_ascii_lowercase() == my_exe {
+                visited.insert(parent_pid);
+                pid = parent_pid;
+                continue;
+            }
+        }
+        break;
+    }
+    pid
 }
 
 fn enumerate_active_audio_pids() -> Vec<u32> {
     let mut pids = HashSet::new();
     let my_pid = std::process::id();
+    let (name_map, parent_map) = build_process_maps();
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -749,7 +1177,8 @@ fn enumerate_active_audio_pids() -> Vec<u32> {
                                                 if pid > 0 && pid != my_pid {
                                                     if let Ok(state) = control2.GetState() {
                                                         if state != AudioSessionStateExpired {
-                                                            pids.insert(pid);
+                                                            let root_pid = find_same_exe_root_pid(pid, &name_map, &parent_map);
+                                                            pids.insert(root_pid);
                                                         }
                                                     }
                                                 }
@@ -1031,19 +1460,105 @@ fn update_app_dsp(pid: u32, channel: String, dsp: ChannelDspDto, state: tauri::S
 }
 
 #[tauri::command]
+fn update_mic_config(config: MicConfigDto, state: tauri::State<AppState>) {
+    if let Ok(mut live) = state.mic_live_config.lock() {
+        *live = config;
+    }
+    state.mic_config_dirty.store(true, Ordering::Relaxed);
+}
+
+#[tauri::command]
+fn get_mic_levels(state: tauri::State<AppState>) -> MicLevelsDto {
+    let in_db = f32::from_bits(state.mic_in_db_bits.load(Ordering::Relaxed));
+    let out_db = f32::from_bits(state.mic_out_db_bits.load(Ordering::Relaxed));
+    let is_running = state.mic_is_active.load(Ordering::Relaxed);
+
+    let conflict_warning = {
+        let s = state.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let m = state.mic_live_config.lock().unwrap_or_else(|e| e.into_inner());
+        if m.enabled && m.output_device != "__NONE__" {
+            if m.output_device == s.blackhole_device {
+                Some("conflict_blackhole".to_string())
+            } else if m.output_device == s.monitor_device {
+                Some("conflict_monitor".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    MicLevelsDto {
+        input_db: in_db,
+        output_db: out_db,
+        is_running,
+        conflict_warning,
+    }
+}
+
+#[tauri::command]
+fn get_app_levels(state: tauri::State<AppState>) -> HashMap<u32, f32> {
+    let mut map = HashMap::new();
+    if let Ok(workers_map) = state.workers.lock() {
+        for w in workers_map.values() {
+            if w.is_running.load(Ordering::Relaxed) {
+                let db = f32::from_bits(w.peak_db_bits.load(Ordering::Relaxed));
+                map.insert(w.pid, db);
+                w.peak_db_bits.store((-120.0f32).to_bits(), Ordering::Relaxed);
+            }
+        }
+    }
+    map
+}
+
+#[tauri::command]
+fn get_input_devices() -> DeviceSettingsDto {
+    let host = cpal::default_host();
+    let mut devices = Vec::new();
+
+    if let Ok(devs) = host.input_devices() {
+        for dev in devs {
+            let name = dev.name().unwrap_or_default();
+            if name.trim().is_empty() {
+                continue;
+            }
+            let sample_rate = dev
+                .default_input_config()
+                .map(|c| c.sample_rate().0)
+                .unwrap_or(48000);
+
+            devices.push(DeviceInfoDto {
+                name,
+                sample_rate,
+                is_default: false,
+            });
+        }
+    }
+
+    DeviceSettingsDto { devices }
+}
+
+#[tauri::command]
 fn get_full_config(state: tauri::State<AppState>) -> FullConfigDto {
     state.settings.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[tauri::command]
 fn save_full_config(config: FullConfigDto, state: tauri::State<AppState>) {
+    if let Some(prof) = config.profiles.get(&config.active_profile_id) {
+        if let Ok(mut live_mic) = state.mic_live_config.lock() {
+            *live_mic = prof.mic.clone();
+        }
+        state.mic_config_dirty.store(true, Ordering::Relaxed);
+    }
     if let Ok(mut current) = state.settings.lock() {
         *current = config.clone();
     }
     if let Ok(json) = serde_json::to_string_pretty(&config) {
         let _ = fs::write("config.json", json);
     }
-    println!(">>> [IPC] 全域設定檔 (含端點、Profiles 與 DSP) 已儲存至 config.json");
+    println!(">>> [IPC] 全域設定檔 (含端點、Profiles、EQ 與麥克風設定) 已儲存至 config.json");
 }
 
 #[tauri::command]
@@ -1104,8 +1619,16 @@ fn get_current_apps(state: tauri::State<AppState>) -> Vec<AppChannelDto> {
     let def_m_vol = f32::from_bits(state.def_mon_vol.load(Ordering::Relaxed));
     let def_s_vol = f32::from_bits(state.def_str_vol.load(Ordering::Relaxed));
 
-    let active_pids = enumerate_active_audio_pids();
-    let process_map = build_process_name_map();
+    let mut active_pids: HashSet<u32> = enumerate_active_audio_pids().into_iter().collect();
+    if let Ok(workers_map) = state.workers.lock() {
+        for w in workers_map.values() {
+            if w.is_running.load(Ordering::Relaxed) {
+                active_pids.insert(w.pid);
+            }
+        }
+    }
+
+    let (process_map, _) = build_process_maps();
     let app_map = state.app_volumes.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut seen_exes: HashSet<String> = HashSet::new();
@@ -1178,6 +1701,18 @@ fn set_autostart(enable: bool) -> bool {
     set_autostart_enabled(enable)
 }
 
+struct WorkerRunningGuard {
+    flag: Arc<AtomicBool>,
+    notifier: Arc<ThrottleNotifier>,
+}
+
+impl Drop for WorkerRunningGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
+        self.notifier.trigger();
+    }
+}
+
 fn spawn_process_capture_worker(
     target_pid: u32,
     sample_rate: u32,
@@ -1187,6 +1722,11 @@ fn spawn_process_capture_worker(
     notifier: Arc<ThrottleNotifier>,
 ) {
     thread::spawn(move || {
+        let _guard = WorkerRunningGuard {
+            flag: Arc::clone(&is_running),
+            notifier: Arc::clone(&notifier),
+        };
+
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
@@ -1194,7 +1734,10 @@ fn spawn_process_capture_worker(
         let proc_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, target_pid) };
         let proc_h = match proc_handle {
             Ok(h) => h,
-            Err(_) => return,
+            Err(_) => {
+                unsafe { CoUninitialize() };
+                return;
+            }
         };
 
         let loopback_params = AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -1229,14 +1772,20 @@ fn spawn_process_capture_worker(
         };
 
         if !activate_ok {
-            let _ = unsafe { CloseHandle(proc_h) };
+            unsafe {
+                let _ = CloseHandle(proc_h);
+                CoUninitialize();
+            }
             return;
         }
 
         let audio_client = match rx.recv_timeout(Duration::from_secs(3)) {
             Ok(Ok(client)) => client,
             _ => {
-                let _ = unsafe { CloseHandle(proc_h) };
+                unsafe {
+                    let _ = CloseHandle(proc_h);
+                    CoUninitialize();
+                }
                 return;
             }
         };
@@ -1268,14 +1817,20 @@ fn spawn_process_capture_worker(
         };
 
         if init_res.is_err() {
-            let _ = unsafe { CloseHandle(proc_h) };
+            unsafe {
+                let _ = CloseHandle(proc_h);
+                CoUninitialize();
+            }
             return;
         }
 
         let audio_event = match unsafe { CreateEventW(None, false, false, PCWSTR(ptr::null())) } {
             Ok(h) => h,
             Err(_) => {
-                let _ = unsafe { CloseHandle(proc_h) };
+                unsafe {
+                    let _ = CloseHandle(proc_h);
+                    CoUninitialize();
+                }
                 return;
             }
         };
@@ -1284,21 +1839,27 @@ fn spawn_process_capture_worker(
         let capture_client: IAudioCaptureClient = match unsafe { audio_client.GetService() } {
             Ok(c) => c,
             Err(_) => {
-                let _ = unsafe { CloseHandle(audio_event) };
-                let _ = unsafe { CloseHandle(proc_h) };
+                unsafe {
+                    let _ = CloseHandle(audio_event);
+                    let _ = CloseHandle(proc_h);
+                    CoUninitialize();
+                }
                 return;
             }
         };
 
         if unsafe { audio_client.Start() }.is_err() {
-            let _ = unsafe { CloseHandle(audio_event) };
-            let _ = unsafe { CloseHandle(proc_h) };
+            unsafe {
+                let _ = CloseHandle(audio_event);
+                let _ = CloseHandle(proc_h);
+                CoUninitialize();
+            }
             return;
         }
 
         println!(">>> [音訊核心] 獨立捕捉通道上線: PID {}", target_pid);
 
-        let wait_handles = [audio_event, proc_h];
+        let wait_handles = [proc_h, audio_event];
 
         'capture_loop: while is_running.load(Ordering::Relaxed) {
             if producer.is_abandoned() {
@@ -1307,9 +1868,12 @@ fn spawn_process_capture_worker(
 
             let wait_res = unsafe { WaitForMultipleObjects(&wait_handles, false, 200) };
             if wait_res == WAIT_OBJECT_0 {
-            } else if wait_res.0 == WAIT_OBJECT_0.0 + 1 {
                 break 'capture_loop;
+            } else if wait_res.0 == WAIT_OBJECT_0.0 + 1 {
             } else {
+                if unsafe { capture_client.GetNextPacketSize() }.is_err() {
+                    break 'capture_loop;
+                }
                 continue;
             }
 
@@ -1368,10 +1932,7 @@ fn spawn_process_capture_worker(
             let _ = CloseHandle(proc_h);
             CoUninitialize();
         }
-        is_running.store(false, Ordering::Relaxed);
         println!(">>> [音訊核心] 獨立捕捉通道卸載: PID {}", target_pid);
-
-        notifier.trigger();
     });
 }
 
@@ -1386,11 +1947,27 @@ fn main() {
     let channels = 2usize;
 
     let initial_settings = load_or_create_config();
+    let initial_mic_cfg = initial_settings
+        .profiles
+        .get(&initial_settings.active_profile_id)
+        .map(|p| p.mic.clone())
+        .unwrap_or_default();
+
     let settings = Arc::new(Mutex::new(initial_settings));
     let icon_cache = Arc::new(Mutex::new(HashMap::new()));
 
     let (stream_prod, mut stream_cons) = RingBuffer::<f32>::new(65536);
     let stream_prod_arc = Arc::new(Mutex::new(stream_prod));
+
+    let (mic_mon_prod, mic_mon_cons) = RingBuffer::<f32>::new(32768);
+    let mic_mon_prod_arc = Arc::new(Mutex::new(mic_mon_prod));
+    let mic_self_mon_flag = Arc::new(AtomicBool::new(initial_mic_cfg.self_monitor));
+
+    let mic_live_config = Arc::new(Mutex::new(initial_mic_cfg));
+    let mic_config_dirty = Arc::new(AtomicBool::new(true));
+    let mic_in_db_bits = Arc::new(AtomicU32::new((-120.0f32).to_bits()));
+    let mic_out_db_bits = Arc::new(AtomicU32::new((-120.0f32).to_bits()));
+    let mic_is_active = Arc::new(AtomicBool::new(false));
 
     let panic_mute = Arc::new(AtomicBool::new(false));
 
@@ -1410,6 +1987,7 @@ fn main() {
     let is_running_cap = Arc::clone(&is_running);
     let is_running_com = Arc::clone(&is_running);
     let is_running_out = Arc::clone(&is_running);
+    let is_running_mic = Arc::clone(&is_running);
 
     let notifier = Arc::new(ThrottleNotifier::new());
     let notifier_sched = Arc::clone(&notifier);
@@ -1556,6 +2134,8 @@ fn main() {
 
     // 3. 事件驅動調度器
     let workers_mgr = Arc::clone(&workers);
+    let settings_sched = Arc::clone(&settings);
+    let app_vols_sched = Arc::clone(&app_volumes);
     let my_pid = std::process::id();
     thread::spawn(move || {
         while is_running_cap.load(Ordering::Relaxed) {
@@ -1564,7 +2144,7 @@ fn main() {
                 while !*d && is_running_cap.load(Ordering::Relaxed) {
                     let (new_d, timeout) = notifier_sched
                         .cvar
-                        .wait_timeout(d, Duration::from_secs(1))
+                        .wait_timeout(d, Duration::from_secs(2))
                         .unwrap();
                     d = new_d;
                     if timeout.timed_out() {
@@ -1581,7 +2161,7 @@ fn main() {
 
             'throttle_loop: loop {
                 let active_pids = enumerate_active_audio_pids();
-                let process_map = build_process_name_map();
+                let (process_map, _) = build_process_maps();
                 let mut workers_map = workers_mgr.lock().unwrap_or_else(|e| e.into_inner());
 
                 let mut current_exes_active: HashSet<String> = HashSet::new();
@@ -1608,12 +2188,45 @@ fn main() {
 
                     let mut mon_dsp = ChannelDspRuntime::default();
                     let mut str_dsp = ChannelDspRuntime::default();
+                    let friendly_name = format_friendly_app_name(&exe_name);
+
+                    if let Ok(s_guard) = settings_sched.lock() {
+                        if let Some(prof) = s_guard.profiles.get(&s_guard.active_profile_id) {
+                            if let Some(app_cfg) = prof.customized_apps.get(&friendly_name) {
+                                if let Ok(mut vols) = app_vols_sched.lock() {
+                                    vols.entry(*pid).or_insert((
+                                        app_cfg.mon_vol,
+                                        app_cfg.str_vol,
+                                        app_cfg.mon_muted,
+                                        app_cfg.str_muted,
+                                    ));
+                                }
+                                if let Some(ref m_dsp) = app_cfg.mon_dsp {
+                                    mon_dsp.update_config(m_dsp, 44100.0);
+                                } else if let Some(ref g_m_dsp) = prof.global.mon_dsp {
+                                    mon_dsp.update_config(g_m_dsp, 44100.0);
+                                }
+                                if let Some(ref s_dsp) = app_cfg.str_dsp {
+                                    str_dsp.update_config(s_dsp, 44100.0);
+                                } else if let Some(ref g_s_dsp) = prof.global.str_dsp {
+                                    str_dsp.update_config(g_s_dsp, 44100.0);
+                                }
+                            } else {
+                                if let Some(ref g_m_dsp) = prof.global.mon_dsp {
+                                    mon_dsp.update_config(g_m_dsp, 44100.0);
+                                }
+                                if let Some(ref g_s_dsp) = prof.global.str_dsp {
+                                    str_dsp.update_config(g_s_dsp, 44100.0);
+                                }
+                            }
+                        }
+                    }
 
                     if let Ok(configs) = dsp_configs_sched.lock() {
-                        if let Some(cfg) = configs.get(&(*pid, "monitor".to_string())).or_else(|| configs.get(&(0, "monitor".to_string()))) {
+                        if let Some(cfg) = configs.get(&(*pid, "monitor".to_string())) {
                             mon_dsp.update_config(cfg, 44100.0);
                         }
-                        if let Some(cfg) = configs.get(&(*pid, "stream".to_string())).or_else(|| configs.get(&(0, "stream".to_string()))) {
+                        if let Some(cfg) = configs.get(&(*pid, "stream".to_string())) {
                             str_dsp.update_config(cfg, 44100.0);
                         }
                     }
@@ -1635,6 +2248,7 @@ fn main() {
                             consumer: cons,
                             mon_dsp,
                             str_dsp,
+                            peak_db_bits: Arc::new(AtomicU32::new((-120.0f32).to_bits())),
                         },
                     );
                 }
@@ -1667,7 +2281,7 @@ fn main() {
         }
     });
 
-    // 4. 實體耳機輸出守護線程 (極速 DSP 零借用衝突架構)
+    // 4. 實體耳機輸出守護線程
     let workers_out = Arc::clone(&workers);
     let app_volumes_out = Arc::clone(&app_volumes);
     let def_mon_vol_out = Arc::clone(&def_mon_vol);
@@ -1676,10 +2290,14 @@ fn main() {
     let def_str_mute_out = Arc::clone(&def_str_mute);
     let stream_prod_for_out = Arc::clone(&stream_prod_arc);
     let settings_for_out = Arc::clone(&settings);
+    let mic_self_mon_for_out = Arc::clone(&mic_self_mon_flag);
 
     thread::spawn(move || {
+        thread::sleep(Duration::from_millis(2000));
+
         let host = cpal::default_host();
         let stream_error_flag = Arc::new(AtomicBool::new(false));
+        let mic_mon_cons_arc = Arc::new(Mutex::new(mic_mon_cons));
 
         while is_running_out.load(Ordering::Relaxed) {
             let (target_name, target_buffer_size) = {
@@ -1711,7 +2329,7 @@ fn main() {
             let device = match target_device {
                 Some(d) => d,
                 None => {
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(1000));
                     continue;
                 }
             };
@@ -1719,115 +2337,149 @@ fn main() {
             let default_cfg = match device.default_output_config() {
                 Ok(c) => c,
                 Err(_) => {
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(1000));
                     continue;
                 }
             };
 
             let mut stream_config: cpal::StreamConfig = default_cfg.clone().into();
-            stream_config.buffer_size = cpal::BufferSize::Fixed(target_buffer_size);
+            stream_config.buffer_size = cpal::BufferSize::Default;
 
             stream_error_flag.store(false, Ordering::Relaxed);
 
-            let build_stream_helper = |cfg: &cpal::StreamConfig| {
-                let workers_cb = Arc::clone(&workers_out);
-                let app_vols_cb = Arc::clone(&app_volumes_out);
-                let def_mon_vol_cb = Arc::clone(&def_mon_vol_out);
-                let def_str_vol_cb = Arc::clone(&def_str_vol_out);
-                let def_mon_mute_cb = Arc::clone(&def_mon_mute_out);
-                let def_str_mute_cb = Arc::clone(&def_str_mute_out);
-                let stream_prod_cb = Arc::clone(&stream_prod_for_out);
-                let err_flag_inner = Arc::clone(&stream_error_flag);
+            let workers_cb = Arc::clone(&workers_out);
+            let app_vols_cb = Arc::clone(&app_volumes_out);
+            let def_mon_vol_cb = Arc::clone(&def_mon_vol_out);
+            let def_str_vol_cb = Arc::clone(&def_str_vol_out);
+            let def_mon_mute_cb = Arc::clone(&def_mon_mute_out);
+            let def_str_mute_cb = Arc::clone(&def_str_mute_out);
+            let stream_prod_cb = Arc::clone(&stream_prod_for_out);
+            let err_flag_inner = Arc::clone(&stream_error_flag);
+            let mic_mon_cons_cb = Arc::clone(&mic_mon_cons_arc);
+            let mic_self_mon_cb = Arc::clone(&mic_self_mon_for_out);
 
-                let mut obs_samples = Vec::with_capacity(2048);
-                let active_buf_size = target_buffer_size as usize;
+            let mut obs_samples = Vec::with_capacity(2048);
+            let active_buf_size = target_buffer_size as usize;
 
-                device.build_output_stream(
-                    cfg,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        let num_samples = data.len();
-                        data.fill(0.0);
+            let stream_res = device.build_output_stream(
+                &stream_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    let num_samples = data.len();
+                    data.fill(0.0);
 
-                        obs_samples.clear();
-                        obs_samples.resize(num_samples, 0.0);
+                    obs_samples.clear();
+                    obs_samples.resize(num_samples, 0.0);
 
-                        if let Ok(mut workers_map) = workers_cb.try_lock() {
-                            let app_vols = app_vols_cb.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Ok(mut workers_map) = workers_cb.try_lock() {
+                        let app_vols = app_vols_cb.lock().unwrap_or_else(|e| e.into_inner());
 
-                            let def_m_vol = f32::from_bits(def_mon_vol_cb.load(Ordering::Relaxed));
-                            let def_s_vol = f32::from_bits(def_str_vol_cb.load(Ordering::Relaxed));
-                            let def_m_mute = def_mon_mute_cb.load(Ordering::Relaxed);
-                            let def_s_mute = def_str_mute_cb.load(Ordering::Relaxed);
+                        let def_m_vol = f32::from_bits(def_mon_vol_cb.load(Ordering::Relaxed));
+                        let def_s_vol = f32::from_bits(def_str_vol_cb.load(Ordering::Relaxed));
+                        let def_m_mute = def_mon_mute_cb.load(Ordering::Relaxed);
+                        let def_s_mute = def_str_mute_cb.load(Ordering::Relaxed);
 
+                        let max_lag = (active_buf_size * 4).max(512) * 2;
+
+                        for worker in workers_map.values_mut() {
+                            if worker.consumer.slots() > max_lag * 2 {
+                                while worker.consumer.slots() > max_lag {
+                                    let _ = worker.consumer.pop();
+                                }
+                            }
+
+                            let (mon_vol, str_vol) = if let Some(&(m_v, s_v, m_m, s_m)) = app_vols.get(&worker.pid) {
+                                (if m_m { 0.0 } else { m_v }, if s_m { 0.0 } else { s_v })
+                            } else {
+                                (if def_m_mute { 0.0 } else { def_m_vol }, if def_s_mute { 0.0 } else { def_s_vol })
+                            };
+
+                            let available = worker.consumer.slots().min(num_samples);
+                            let frames_to_read = (available / 2) * 2;
+
+                            let mut app_peak = 0.0f32;
+                            for i in (0..frames_to_read).step_by(2) {
+                                let l = worker.consumer.pop().unwrap_or(0.0);
+                                let r = worker.consumer.pop().unwrap_or(0.0);
+
+                                let (m_l, m_r) = worker.mon_dsp.process_stereo(l, r);
+                                let (s_l, s_r) = worker.str_dsp.process_stereo(l, r);
+
+                                let out_l = m_l * mon_vol;
+                                let out_r = m_r * mon_vol;
+                                let p = out_l.abs().max(out_r.abs());
+                                if p > app_peak {
+                                    app_peak = p;
+                                }
+
+                                data[i] += out_l;
+                                data[i + 1] += out_r;
+
+                                obs_samples[i] += s_l * str_vol;
+                                obs_samples[i + 1] += s_r * str_vol;
+                            }
+
+                            if frames_to_read > 0 {
+                                let db = if app_peak > 1e-6 { 20.0 * app_peak.log10() } else { -120.0 };
+                                let prev_db = f32::from_bits(worker.peak_db_bits.load(Ordering::Relaxed));
+                                if db > prev_db {
+                                    worker.peak_db_bits.store(db.to_bits(), Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+
+                    if let Ok(mut m_cons) = mic_mon_cons_cb.try_lock() {
+                        if mic_self_mon_cb.load(Ordering::Relaxed) {
                             let max_lag = (active_buf_size * 4).max(512) * 2;
-
-                            for worker in workers_map.values_mut() {
-                                if worker.consumer.slots() > max_lag * 2 {
-                                    while worker.consumer.slots() > max_lag {
-                                        let _ = worker.consumer.pop();
-                                    }
-                                }
-
-                                let (mon_vol, str_vol) = if let Some(&(m_v, s_v, m_m, s_m)) = app_vols.get(&worker.pid) {
-                                    (if m_m { 0.0 } else { m_v }, if s_m { 0.0 } else { s_v })
-                                } else {
-                                    (if def_m_mute { 0.0 } else { def_m_vol }, if def_s_mute { 0.0 } else { def_s_vol })
-                                };
-
-                                let available = worker.consumer.slots().min(num_samples);
-                                let frames_to_read = (available / 2) * 2;
-
-                                for i in (0..frames_to_read).step_by(2) {
-                                    let l = worker.consumer.pop().unwrap_or(0.0);
-                                    let r = worker.consumer.pop().unwrap_or(0.0);
-
-                                    let (m_l, m_r) = worker.mon_dsp.process_stereo(l, r);
-                                    let (s_l, s_r) = worker.str_dsp.process_stereo(l, r);
-
-                                    data[i] += m_l * mon_vol;
-                                    data[i + 1] += m_r * mon_vol;
-
-                                    obs_samples[i] += s_l * str_vol;
-                                    obs_samples[i + 1] += s_r * str_vol;
+                            if m_cons.slots() > max_lag * 2 {
+                                while m_cons.slots() > max_lag {
+                                    let _ = m_cons.pop();
                                 }
                             }
-                        }
-
-                        for sample in data.iter_mut() {
-                            *sample = sample.clamp(-1.0, 1.0);
-                        }
-
-                        if let Ok(mut str_prod) = stream_prod_cb.try_lock() {
-                            for &sample in &obs_samples {
-                                let _ = str_prod.push(sample.clamp(-1.0, 1.0));
+                            let avail = m_cons.slots().min(num_samples);
+                            let frames = (avail / 2) * 2;
+                            for i in (0..frames).step_by(2) {
+                                let ml = m_cons.pop().unwrap_or(0.0);
+                                let mr = m_cons.pop().unwrap_or(0.0);
+                                data[i] += ml;
+                                data[i + 1] += mr;
                             }
+                        } else {
+                            while m_cons.pop().is_ok() {}
                         }
-                    },
-                    move |_err| {
-                        err_flag_inner.store(true, Ordering::Relaxed);
-                    },
-                    None,
-                )
-            };
+                    }
 
-            let stream_res = build_stream_helper(&stream_config)
-                .or_else(|_| build_stream_helper(&default_cfg.into()));
+                    for sample in data.iter_mut() {
+                        *sample = sample.clamp(-1.0, 1.0);
+                    }
+
+                    if let Ok(mut str_prod) = stream_prod_cb.try_lock() {
+                        for &sample in &obs_samples {
+                            let _ = str_prod.push(sample.clamp(-1.0, 1.0));
+                        }
+                    }
+                },
+                move |_err| {
+                    err_flag_inner.store(true, Ordering::Relaxed);
+                },
+                None,
+            );
 
             let stream = match stream_res {
                 Ok(s) => s,
                 Err(_) => {
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(1000));
                     continue;
                 }
             };
 
             if stream.play().is_err() {
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(1000));
                 continue;
             }
 
-            println!(">>> [Tauri 後端] 實體耳機輸出已上線: {} ({}) [緩衝區: {} 幀]",
-                target_name, resolved_device_name, target_buffer_size);
+            println!(">>> [Tauri 後端] 實體耳機輸出已上線: {} ({})",
+                target_name, resolved_device_name);
 
             while is_running_out.load(Ordering::Relaxed) && !stream_error_flag.load(Ordering::Relaxed) {
                 let (current_setting, current_buf) = {
@@ -1848,15 +2500,402 @@ fn main() {
                     }
                 }
 
-                thread::sleep(Duration::from_millis(200));
+                thread::sleep(Duration::from_millis(250));
             }
 
             drop(stream);
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(500));
         }
     });
 
-    // 5. 系統匣設定
+    // 5. 麥克風擴充模組守護線程
+    let mic_cfg_thread = Arc::clone(&mic_live_config);
+    let mic_dirty_thread = Arc::clone(&mic_config_dirty);
+    let mic_in_db_thread = Arc::clone(&mic_in_db_bits);
+    let mic_out_db_thread = Arc::clone(&mic_out_db_bits);
+    let mic_active_thread = Arc::clone(&mic_is_active);
+    let mic_self_mon_thread = Arc::clone(&mic_self_mon_flag);
+    let mic_mon_prod_thread = Arc::clone(&mic_mon_prod_arc);
+    let settings_for_mic = Arc::clone(&settings);
+
+    thread::spawn(move || {
+        let host = cpal::default_host();
+
+        while is_running_mic.load(Ordering::Relaxed) {
+            let current_cfg = {
+                mic_cfg_thread.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            };
+
+            mic_self_mon_thread.store(current_cfg.enabled && current_cfg.self_monitor, Ordering::Relaxed);
+
+            if !current_cfg.enabled {
+                mic_active_thread.store(false, Ordering::Relaxed);
+                mic_in_db_thread.store((-120.0f32).to_bits(), Ordering::Relaxed);
+                mic_out_db_thread.store((-120.0f32).to_bits(), Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+
+            let in_dev_opt = if current_cfg.input_device == "__DEFAULT__" {
+                host.default_input_device()
+            } else {
+                host.input_devices().ok().and_then(|mut devs| {
+                    devs.find(|d| {
+                        let n = d.name().unwrap_or_default();
+                        n == current_cfg.input_device || n.contains(&current_cfg.input_device)
+                    })
+                })
+            };
+
+            let in_device = match in_dev_opt {
+                Some(d) => d,
+                None => {
+                    mic_active_thread.store(false, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            let in_default_cfg = match in_device.default_input_config() {
+                Ok(c) => c,
+                Err(_) => {
+                    mic_active_thread.store(false, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            let in_sample_format = in_default_cfg.sample_format();
+            let in_sample_rate = in_default_cfg.sample_rate().0;
+            let in_channels = in_default_cfg.channels() as usize;
+            let in_stream_cfg: cpal::StreamConfig = in_default_cfg.clone().into();
+
+            let (blackhole_dev_name, monitor_dev_name) = {
+                let s = settings_for_mic.lock().unwrap_or_else(|e| e.into_inner());
+                (s.blackhole_device.clone(), s.monitor_device.clone())
+            };
+
+            let out_dev_target = current_cfg.output_device.clone();
+            let is_conflict = out_dev_target == blackhole_dev_name || out_dev_target == monitor_dev_name;
+
+            let (mic_out_prod, mut mic_out_cons) = RingBuffer::<f32>::new(65536);
+            let out_stream_err = Arc::new(AtomicBool::new(false));
+            let mut active_out_stream = None;
+
+            if out_dev_target != "__NONE__" && !out_dev_target.starts_with("__MIC_READONLY_") && !is_conflict {
+                let out_dev_opt = host.output_devices().ok().and_then(|mut devs| {
+                    devs.find(|d| {
+                        let n = d.name().unwrap_or_default();
+                        n == out_dev_target || n.contains(&out_dev_target)
+                    })
+                });
+
+                if let Some(out_dev) = out_dev_opt {
+                    if let Ok(out_def_cfg) = out_dev.default_output_config() {
+                        let out_format = out_def_cfg.sample_format();
+                        let mut out_cfg: cpal::StreamConfig = out_def_cfg.clone().into();
+                        out_cfg.buffer_size = cpal::BufferSize::Default;
+
+                        let out_ch = out_cfg.channels as usize;
+                        let out_sample_rate = out_cfg.sample_rate.0;
+                        let resample_ratio = (in_sample_rate as f64) / (out_sample_rate as f64);
+
+                        let err_c = Arc::clone(&out_stream_err);
+                        let mut frac = 0.0f64;
+                        let mut last_s = 0.0f32;
+                        let mut curr_s = 0.0f32;
+                        let mut dither_sign = 1.0f32;
+                        let mut is_primed = false;
+
+                        let stream_res = match out_format {
+                            cpal::SampleFormat::I16 => out_dev.build_output_stream(
+                                &out_cfg,
+                                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                                    if mic_out_cons.slots() > 2200 {
+                                        while mic_out_cons.slots() > 1320 {
+                                            let _ = mic_out_cons.pop();
+                                        }
+                                    }
+                                    if !is_primed {
+                                        if mic_out_cons.slots() >= 960 {
+                                            is_primed = true;
+                                        } else {
+                                            for sample in data.iter_mut() {
+                                                dither_sign = -dither_sign;
+                                                *sample = dither_sign as i16;
+                                            }
+                                            return;
+                                        }
+                                    }
+
+                                    let frames = data.len() / out_ch.max(1);
+                                    for f in 0..frames {
+                                        frac += resample_ratio;
+                                        while frac >= 1.0 {
+                                            frac -= 1.0;
+                                            last_s = curr_s;
+                                            if let Ok(s) = mic_out_cons.pop() {
+                                                curr_s = s;
+                                            } else {
+                                                is_primed = false;
+                                                curr_s *= 0.98;
+                                            }
+                                        }
+                                        let sample = if (resample_ratio - 1.0).abs() < 0.001 {
+                                            curr_s
+                                        } else {
+                                            last_s + (curr_s - last_s) * (frac as f32)
+                                        };
+                                        dither_sign = -dither_sign;
+                                        let val_i16 = ((sample.clamp(-1.0, 1.0) * 32766.0) as i16).saturating_add(dither_sign as i16);
+                                        for c in 0..out_ch {
+                                            data[f * out_ch + c] = val_i16;
+                                        }
+                                    }
+                                },
+                                move |_| {
+                                    err_c.store(true, Ordering::Relaxed);
+                                },
+                                None,
+                            ),
+                            _ => out_dev.build_output_stream(
+                                &out_cfg,
+                                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                                    if mic_out_cons.slots() > 2200 {
+                                        while mic_out_cons.slots() > 1320 {
+                                            let _ = mic_out_cons.pop();
+                                        }
+                                    }
+                                    if !is_primed {
+                                        if mic_out_cons.slots() >= 960 {
+                                            is_primed = true;
+                                        } else {
+                                            for sample in data.iter_mut() {
+                                                dither_sign = -dither_sign;
+                                                *sample = dither_sign * 1e-5;
+                                            }
+                                            return;
+                                        }
+                                    }
+
+                                    let frames = data.len() / out_ch.max(1);
+                                    for f in 0..frames {
+                                        frac += resample_ratio;
+                                        while frac >= 1.0 {
+                                            frac -= 1.0;
+                                            last_s = curr_s;
+                                            if let Ok(s) = mic_out_cons.pop() {
+                                                curr_s = s;
+                                            } else {
+                                                is_primed = false;
+                                                curr_s *= 0.98;
+                                            }
+                                        }
+                                        dither_sign = -dither_sign;
+                                        let sample = if (resample_ratio - 1.0).abs() < 0.001 {
+                                            curr_s
+                                        } else {
+                                            last_s + (curr_s - last_s) * (frac as f32)
+                                        } + (dither_sign * 1e-5);
+
+                                        for c in 0..out_ch {
+                                            data[f * out_ch + c] = sample;
+                                        }
+                                    }
+                                },
+                                move |_| {
+                                    err_c.store(true, Ordering::Relaxed);
+                                },
+                                None,
+                            ),
+                        };
+
+                        if let Ok(s) = stream_res {
+                            let _ = s.play();
+                            active_out_stream = Some(s);
+                            println!(
+                                ">>> [麥克風引擎] 轉送目標已上線 (30ms 不斷流模式): {} (In: {}Hz -> Out: {}Hz, 格式: {:?})",
+                                out_dev_target, in_sample_rate, out_sample_rate, out_format
+                            );
+                        }
+                    }
+                }
+            }
+
+            let in_stream_err = Arc::new(AtomicBool::new(false));
+            let in_err_c = Arc::clone(&in_stream_err);
+
+            let mut dsp_runtime = MicDspRuntime::new(in_sample_rate as f32);
+            dsp_runtime.update_config(&current_cfg);
+            let mic_dsp_state = Arc::new(Mutex::new((dsp_runtime, mic_out_prod)));
+
+            let cfg_cb = Arc::clone(&mic_cfg_thread);
+            let dirty_cb = Arc::clone(&mic_dirty_thread);
+            let in_db_cb = Arc::clone(&mic_in_db_thread);
+            let out_db_cb = Arc::clone(&mic_out_db_thread);
+            let self_mon_cb = Arc::clone(&mic_self_mon_thread);
+            let mon_prod_cb = Arc::clone(&mic_mon_prod_thread);
+            let dsp_state_cb = Arc::clone(&mic_dsp_state);
+
+            let mut mono_in_buf = Vec::with_capacity(2048);
+            let mut mono_out_buf = Vec::with_capacity(2048);
+
+            let in_stream_res = match in_sample_format {
+                cpal::SampleFormat::I16 => in_device.build_input_stream(
+                    &in_stream_cfg,
+                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut state) = dsp_state_cb.try_lock() {
+                            let (ref mut dsp, ref mut prod) = *state;
+                            if dirty_cb.swap(false, Ordering::Relaxed) {
+                                if let Ok(c) = cfg_cb.lock() {
+                                    dsp.update_config(&c);
+                                    self_mon_cb.store(c.enabled && c.self_monitor, Ordering::Relaxed);
+                                }
+                            }
+                            mono_in_buf.clear();
+                            let ch = in_channels.max(1);
+                            let mut in_peak = 0.0f32;
+                            for frame in data.chunks(ch) {
+                                let m = (frame[0] as f32) / 32768.0;
+                                let abs_m = m.abs();
+                                if abs_m > in_peak {
+                                    in_peak = abs_m;
+                                }
+                                mono_in_buf.push(m);
+                            }
+                            let in_db = if in_peak > 1e-6 { 20.0 * in_peak.log10() } else { -120.0 };
+                            in_db_cb.store(in_db.to_bits(), Ordering::Relaxed);
+
+                            dsp.process_mono_chunk(&mono_in_buf, &mut mono_out_buf);
+
+                            let mut out_peak = 0.0f32;
+                            for &s in &mono_out_buf {
+                                let abs_s = s.abs();
+                                if abs_s > out_peak {
+                                    out_peak = abs_s;
+                                }
+                                let _ = prod.push(s);
+                            }
+                            if !mono_out_buf.is_empty() {
+                                let out_db = if out_peak > 1e-6 { 20.0 * out_peak.log10() } else { -120.0 };
+                                out_db_cb.store(out_db.to_bits(), Ordering::Relaxed);
+                            }
+                            if self_mon_cb.load(Ordering::Relaxed) {
+                                if let Ok(mut mon_p) = mon_prod_cb.try_lock() {
+                                    for &s in &mono_out_buf {
+                                        let _ = mon_p.push(s);
+                                        let _ = mon_p.push(s);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    move |_| {
+                        in_err_c.store(true, Ordering::Relaxed);
+                    },
+                    None,
+                ),
+                _ => in_device.build_input_stream(
+                    &in_stream_cfg,
+                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                        if let Ok(mut state) = dsp_state_cb.try_lock() {
+                            let (ref mut dsp, ref mut prod) = *state;
+                            if dirty_cb.swap(false, Ordering::Relaxed) {
+                                if let Ok(c) = cfg_cb.lock() {
+                                    dsp.update_config(&c);
+                                    self_mon_cb.store(c.enabled && c.self_monitor, Ordering::Relaxed);
+                                }
+                            }
+                            mono_in_buf.clear();
+                            let ch = in_channels.max(1);
+                            let mut in_peak = 0.0f32;
+                            for frame in data.chunks(ch) {
+                                let m = frame[0];
+                                let abs_m = m.abs();
+                                if abs_m > in_peak {
+                                    in_peak = abs_m;
+                                }
+                                mono_in_buf.push(m);
+                            }
+                            let in_db = if in_peak > 1e-6 { 20.0 * in_peak.log10() } else { -120.0 };
+                            in_db_cb.store(in_db.to_bits(), Ordering::Relaxed);
+
+                            dsp.process_mono_chunk(&mono_in_buf, &mut mono_out_buf);
+
+                            let mut out_peak = 0.0f32;
+                            for &s in &mono_out_buf {
+                                let abs_s = s.abs();
+                                if abs_s > out_peak {
+                                    out_peak = abs_s;
+                                }
+                                let _ = prod.push(s);
+                            }
+                            if !mono_out_buf.is_empty() {
+                                let out_db = if out_peak > 1e-6 { 20.0 * out_peak.log10() } else { -120.0 };
+                                out_db_cb.store(out_db.to_bits(), Ordering::Relaxed);
+                            }
+                            if self_mon_cb.load(Ordering::Relaxed) {
+                                if let Ok(mut mon_p) = mon_prod_cb.try_lock() {
+                                    for &s in &mono_out_buf {
+                                        let _ = mon_p.push(s);
+                                        let _ = mon_p.push(s);
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    move |_| {
+                        in_err_c.store(true, Ordering::Relaxed);
+                    },
+                    None,
+                ),
+            };
+
+            let in_stream = match in_stream_res {
+                Ok(s) => s,
+                Err(_) => {
+                    mic_active_thread.store(false, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            };
+
+            if in_stream.play().is_err() {
+                mic_active_thread.store(false, Ordering::Relaxed);
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
+            mic_active_thread.store(true, Ordering::Relaxed);
+            println!(">>> [麥克風引擎] 4 級 DSP 收音鏈路已啟動: {}", current_cfg.input_device);
+
+            let active_in_dev = current_cfg.input_device.clone();
+            let active_out_dev = current_cfg.output_device.clone();
+
+            while is_running_mic.load(Ordering::Relaxed)
+                && !in_stream_err.load(Ordering::Relaxed)
+                && !out_stream_err.load(Ordering::Relaxed)
+            {
+                let (now_enabled, now_in, now_out) = {
+                    let c = mic_cfg_thread.lock().unwrap_or_else(|e| e.into_inner());
+                    (c.enabled, c.input_device.clone(), c.output_device.clone())
+                };
+
+                if !now_enabled || now_in != active_in_dev || now_out != active_out_dev {
+                    break;
+                }
+
+                thread::sleep(Duration::from_millis(200));
+            }
+
+            drop(in_stream);
+            drop(active_out_stream);
+            mic_active_thread.store(false, Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    // 6. 系統匣設定
     let tray_menu = SystemTrayMenu::new()
         .add_item(CustomMenuItem::new("open", "開啟 DR_AudioRouter"))
         .add_item(CustomMenuItem::new("quit", "完全結束程式"));
@@ -1865,7 +2904,7 @@ fn main() {
 
     let is_minimized_launch = std::env::args().any(|a| a == "--minimized");
 
-    // 6. Tauri 主視窗啟動
+    // 7. Tauri 主視窗啟動
     tauri::Builder::default()
         .system_tray(system_tray)
         .on_system_tray_event(|app, event| match event {
@@ -1924,6 +2963,11 @@ fn main() {
             settings,
             icon_cache,
             workers,
+            mic_live_config,
+            mic_config_dirty,
+            mic_in_db_bits,
+            mic_out_db_bits,
+            mic_is_active,
         })
         .invoke_handler(tauri::generate_handler![
             set_default_mute,
@@ -1931,6 +2975,10 @@ fn main() {
             update_app_channel,
             reset_app_channel,
             update_app_dsp,
+            update_mic_config,
+            get_mic_levels,
+            get_app_levels,
+            get_input_devices,
             get_current_apps,
             get_audio_devices,
             get_audio_settings,
