@@ -19,6 +19,11 @@
   <img src="https://img.shields.io/badge/Latency-%3C%2030ms-brightgreen" alt="Latency">
 </p>
 
+> ### 📖 新手快速上手指南 / Quick Start Guide
+> 如果你不熟悉程式碼或技術架構，請直接點擊下方新手操作手冊進行設定：
+> * 🇹🇼 **[繁體中文新手操作手冊 (Intro)](Intro.md)**
+> * 🇺🇸 **[English User Manual (Intro.en)](Intro.en.md)**
+
 ---
 
 ## 📌 為什麼選擇 DR_AudioRouter？
